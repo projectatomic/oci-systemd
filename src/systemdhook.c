@@ -7,6 +7,7 @@
 #include <sys/mount.h>
 #include <syslog.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <fcntl.h>
 #include <sched.h>
@@ -196,6 +197,21 @@ static int prestart(const char *rootfs,
 		return -1;
 	}
 
+	struct statvfs fs_stat;
+
+	/* Stat the rootfs to see if it is a --read-only mount */
+	if (statvfs(rootfs, &fs_stat) == -1) {
+		pr_perror("Can't stat %s", rootfs);
+		return -1;
+	}
+
+	if (fs_stat.f_flag & ST_RDONLY) {
+		if (mount(rootfs, rootfs, "bind", MS_REMOUNT|MS_BIND|MS_REC, "rw") == -1) {
+			pr_perror("Failed to remount %s", rootfs);
+			return -1;
+		}
+	}
+
 	char run_dir[PATH_MAX];
 	snprintf(run_dir, PATH_MAX, "%s/run", rootfs);
 
@@ -286,25 +302,8 @@ static int prestart(const char *rootfs,
 	}
 
 	if (!contains_mount(config_mounts, config_mounts_len, "/var/log/journal")) {
-		char journal_dir[PATH_MAX];
-		snprintf(journal_dir, PATH_MAX, "/var/log/journal/%.32s", id);
 		char cont_journal_dir[PATH_MAX];
-		snprintf(cont_journal_dir, PATH_MAX, "%s%s", rootfs, journal_dir);
-		if (makepath(journal_dir, 0755) == -1) {
-			if (errno != EEXIST) {
-				pr_perror("Failed to mkdir journal dir");
-				return -1;
-			}
-		}
-
-		if (strcmp("", mount_label)) {
-			rc = setfilecon(journal_dir, mount_label);
-			if (rc < 0) {
-				pr_perror("Failed to set journal dir selinux context");
-				return -1;
-			}
-		}
-
+		snprintf(cont_journal_dir, PATH_MAX, "%s/var/log/journal", rootfs);
 		if (makepath(cont_journal_dir, 0755) == -1) {
 			if (errno != EEXIST) {
 				pr_perror("Failed to mkdir container journal dir");
@@ -312,9 +311,13 @@ static int prestart(const char *rootfs,
 			}
 		}
 
-		/* Mount journal directory at /var/log/journal/UUID in the container */
-		if (mount(journal_dir, cont_journal_dir, "bind", MS_BIND|MS_REC, NULL) == -1) {
-			pr_perror("Failed to mount %s at %s", journal_dir, cont_journal_dir);
+		/* Mount journal directory at /var/log/journal in the container */
+		if (mount(cont_journal_dir, cont_journal_dir, "bind", MS_BIND|MS_REC, NULL) == -1) {
+			pr_perror("Failed to mount %s", cont_journal_dir);
+			return -1;
+		}
+		if (mount(cont_journal_dir, cont_journal_dir, "bind", MS_REMOUNT|MS_BIND|MS_REC, "rw") == -1) {
+			pr_perror("Failed to remount %s", cont_journal_dir);
 			return -1;
 		}
 	}
@@ -354,6 +357,12 @@ static int prestart(const char *rootfs,
 		}
 	}
 
+	if (fs_stat.f_flag & ST_RDONLY) {
+		if (mount(rootfs, rootfs, "bind", MS_REMOUNT|MS_BIND|MS_REC, "ro") == -1) {
+			pr_perror("Failed to remount %s", rootfs);
+			return -1;
+		}
+	}
 	return 0;
 }
 
