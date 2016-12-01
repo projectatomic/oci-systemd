@@ -686,7 +686,7 @@ int main(int argc, char *argv[])
 	char *id = YAJL_GET_STRING(v_id);
 
 	const char *ctr = getenv("container");
-	if (!strncmp(ctr, DOCKER_CONTAINER, strlen(DOCKER_CONTAINER))) {
+	if (ctr && !strncmp(ctr, DOCKER_CONTAINER, strlen(DOCKER_CONTAINER))) {
 		docker = true;
 	}
 
