@@ -1,0 +1,5 @@
+{
+    "cmd": [".*/init$" , ".*/systemd$" ],
+    "hook": "/usr/libexec/oci/hooks.d/oci-systemd-hook",
+    "stages": [ "prestart", "poststop" ]
+}
