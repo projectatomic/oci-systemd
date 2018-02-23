@@ -231,10 +231,8 @@ static char *get_process_cgroup_subsystem_path(const char *id, int pid, const ch
 			pr_perror("%s: Error parsing cgroup, ':' not found: %s", id, line);
 			return NULL;
 		}
-		pr_pdebug("%s: %s", id, ptr);
 		ptr++;
 		if (!strncmp(ptr, subsystem, strlen(subsystem))) {
-			pr_pdebug("%s: Found cgroup", id);
 			char *path = strchr(ptr, '/');
 			if (path == NULL) {
 				pr_perror("%s: Error finding path in cgroup: %s", id, line);
@@ -247,7 +245,6 @@ static char *get_process_cgroup_subsystem_path(const char *id, int pid, const ch
 			} else {
 				subpath++;
 			}
-
 			rc = asprintf(&subsystem_path, "%s/%s%s", CGROUP_ROOT, subpath, path);
 			if (rc < 0) {
 				pr_perror("%s: Failed to allocate memory for subsystemd path", id);
@@ -260,6 +257,119 @@ static char *get_process_cgroup_subsystem_path(const char *id, int pid, const ch
 	}
 
 	return NULL;
+}
+
+/*
+ * Set the cgroup file systemd hierarchies appropriately.
+ */
+static int set_process_cgroup_subsystem_paths(const char *id, int uid, int gid, int pid, const char *mount_label, const char *rootfs) {
+	_cleanup_free_ char *cgroups_file_path = NULL;
+	int rc;
+	rc = asprintf(&cgroups_file_path, "/proc/%d/cgroup", pid);
+	if (rc < 0) {
+		pr_perror("%s: Failed to allocate memory for cgroups file path", id);
+		return -1;
+	}
+
+	_cleanup_fclose_ FILE *fp = NULL;
+	fp = fopen(cgroups_file_path, "r");
+	if (fp == NULL) {
+		pr_perror("%s: Failed to open cgroups file", id);
+		return -1;
+	}
+
+	_cleanup_free_ char *line = NULL;
+	ssize_t read;
+	size_t len = 0;
+	char *ptr = NULL;
+	char *subsystem_path = NULL;
+	char *colon = NULL;
+	static const char double_colon[] = "::";
+
+	while ((read = getline(&line, &len, fp)) != -1) {
+		pr_pdebug("Line: %s: %s", line, id);
+		ptr = strchr(line, ':');
+		if (ptr == NULL) {
+			pr_perror("%s: Error parsing cgroup, ':' not found: %s", id, line);
+			continue;
+		}
+
+		// Skip if we've a double colon to start (blank hierarchy)
+		if (strncmp(double_colon, ptr, strlen(double_colon)) == 0) {
+			continue;
+		}
+
+		// Advance to the char after the colon (':') in the string.
+		ptr++;
+
+		char *path = strchr(ptr, '/');
+		if (path == NULL) {
+			pr_perror("%s: Error finding path in cgroup: %s", id, line);
+			continue;
+		}
+		pr_pdebug("%s: PATH: %s", id, path);
+
+		// Handle 'name=systemd', shorten to point to systemd.
+		// Otherwise point to the char after the colon (':').
+		const char *subpath = strchr(ptr, '=');
+		if (subpath == NULL) {
+			subpath = ptr;
+		} else {
+			subpath++;
+		}
+		colon = strchr(subpath, ':');
+
+		int colon_index = (int)(colon - subpath);
+		if (colon_index < 1) {
+			continue;
+		}
+
+		// Extract the hierarchy name.  The ending colon (':') for the hierarchy
+		// name is at the colon_index location in subpath.  Copy the characters from
+		// the start of the subpath to colon_index to get the hierarchy name such
+		// as 'cpuset', 'pids', 'blkio', 'hugetlb', 'freezer', 'devices', etc.
+		char hier_name[128];
+		memset(hier_name, '\0', sizeof(hier_name));
+		strncpy(hier_name, subpath, colon_index);
+		pr_pdebug("%s: HIERARCHY: %s", id, hier_name);
+		rc = asprintf(&subsystem_path, "%s/%s%s", CGROUP_ROOT, hier_name, path);
+		if (rc < 0) {
+			pr_perror("%s: Failed to allocate memory for subsystemd path", id);
+			continue;
+		}
+		pr_pdebug("%s: SUBSYSTEM_PATH: %s", id, subsystem_path);
+		subsystem_path[strlen(subsystem_path) - 1] = '\0';
+
+		_cleanup_free_ char *systemd_named_path = NULL;
+		if (asprintf(&systemd_named_path, "%s/%s", rootfs, subsystem_path) < 0) {
+			pr_perror("%s: Failed to create path for %s/%s", id, rootfs, systemd_named_path);
+			continue;
+		}
+
+		if (bind_mount(id, subsystem_path, systemd_named_path, false)) {
+			pr_perror("%s: Failed to bind mount %s on %s", id, CGROUP_SYSTEMD, systemd_named_path);
+			continue;
+		}
+
+		/***
+		* chown will fail on /var/lib/docker files as they are not on the
+		* container so let's pass false to not have it done in the chperm
+		* function.
+		***/
+		if (chperm(id, systemd_named_path, mount_label, uid, gid, false) < 0) {
+			continue;
+		}
+
+		/***
+		* chown files in the /sys/fs/cgroup directory paths to the
+		* container's uid and gid, so let's pass true here.
+		***/
+		if (chperm(id, subsystem_path, mount_label, uid, gid, true) < 0) {
+			continue;
+		}
+	}
+
+	return 0;
 }
 
 /*
@@ -642,40 +752,17 @@ static int prestart(const char *rootfs,
 		}
 	}
 
-	if (bind_mount(id, CGROUP_SYSTEMD, systemd_path, true)) {
+	if (bind_mount(id, CGROUP_SYSTEMD, systemd_path, false)) {
 		pr_perror("%s: Failed to bind mount %s on %s", id, CGROUP_SYSTEMD, systemd_path);
 		return -1;
 	}
 
 	/*
-	   Mount the writable systemd hierarchy into the container
+	   Mount the writable systemd hierarchies into the container
 	*/
-	_cleanup_free_ char *named_path = NULL;
-	named_path = get_process_cgroup_subsystem_path(id, pid, "name=systemd");
-	_cleanup_free_ char *systemd_named_path = NULL;
-	if (asprintf(&systemd_named_path, "%s/%s", rootfs, named_path) < 0) {
-		pr_perror("%s: Failed to create path for %s/%s", id, rootfs, systemd_named_path);
-		return -1;
-	}
-	if (bind_mount(id, named_path, systemd_named_path, false)) {
-		pr_perror("%s: Failed to bind mount %s on %s", id, CGROUP_SYSTEMD, systemd_named_path);
-		return -1;
-	}
 
-	/***
-	* chown will fail on /var/lib/docker files as they are not on the
-	* container so let's pass false to not have it done in the chperm
-	* function.
-	***/
-	if (chperm(id, systemd_named_path, mount_label, uid, gid, false) < 0) {
-		return -1;
-	}
-
-	/***
-	* chown files in the /sys/fs/cgroup directory paths to the
-	* container's uid and gid, so let's pass true here.
-	***/
-	if (chperm(id, named_path, mount_label, uid, gid, true) < 0) {
+	if (set_process_cgroup_subsystem_paths(id, uid, gid, pid, mount_label, rootfs)) {
+		pr_perror("%s: Failed to set systemd hierarchy directories", id);
 		return -1;
 	}
 
@@ -696,7 +783,7 @@ static int prestart(const char *rootfs,
 			pr_perror("%s: Failed to write id to %s", id, mid_path);
 			return -1;
 		}
-	}
+	} /* End for */
 
 	return 0;
 }
