@@ -1,8 +1,8 @@
 libexec_PROGRAMS = oci-systemd-hook
 oci_systemd_hook_SOURCES= src/systemdhook.c
 
-oci_systemd_hook_CFLAGS = -Wall -Wextra -std=c99 $(YAJL_CFLAGS)
-oci_systemd_hook_LDADD = $(YAJL_LIBS)
+oci_systemd_hook_CFLAGS = -Wall -Wextra -std=c99 $(JANSSON_CFLAGS)
+oci_systemd_hook_LDADD = $(JANSSON_LIBS)
 oci_systemd_hook_CFLAGS += $(SELINUX_CFLAGS)
 oci_systemd_hook_LDADD += $(SELINUX_LIBS)
 oci_systemd_hook_CFLAGS += $(LIBMOUNT_CFLAGS)
