@@ -191,7 +191,7 @@ static char *get_file_contents(const char *id, const char *path) {
 
 	char buffer[256];
 	ssize_t rd;
-	rd = read(fd, buffer, 256);
+	rd = read(fd, buffer, sizeof(buffer)-1);
 	if (rd == -1) {
 		pr_perror("%s: Failed to read file contents", id);
 		return NULL;
