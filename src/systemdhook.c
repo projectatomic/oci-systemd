@@ -156,6 +156,10 @@ static int chperm(const char *id, const char *path, const char *label, uint uid,
 	if ((dir = opendir (path)) != NULL) {
 		/* print all the files and directories within directory */
 		while ((ent = readdir (dir)) != NULL) {
+			if (!strcmp("..", ent->d_name)) {
+				// Do not touch the parent directory
+				continue;
+			}
 			_cleanup_free_ char *full_path = NULL;
 			if (asprintf(&full_path, "%s/%s", path, ent->d_name) < 0) {
 				pr_perror("%s: Failed to create path for chperm", id);
