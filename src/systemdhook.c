@@ -113,7 +113,12 @@ static int makefilepath(char *file, mode_t mode)
     if (makepath(dirname(strdupa(file)), mode) < 0 && errno != EEXIST)
       return -1;
 
-    return creat(file, mode);
+    int fd = creat(file, mode);
+    if (fd != -1) {
+	    close(fd);
+	    return 0;
+    }
+    return fd;
 }
 
 static int remount_readonly(const char *id, const char *src, const char* dest) {
@@ -145,12 +150,16 @@ static int bind_mount(const char *id, const char *src, const char *dest, int rea
 	return 0;
 }
 
-static int chperm(const char *id, const char *path, const char *label, int uid, int gid, bool doChown) {
+static int chperm(const char *id, const char *path, const char *label, uint uid, uint gid, bool doChown) {
 	DIR *dir;
 	struct dirent *ent;
 	if ((dir = opendir (path)) != NULL) {
 		/* print all the files and directories within directory */
 		while ((ent = readdir (dir)) != NULL) {
+			if (!strcmp("..", ent->d_name)) {
+				// Do not touch the parent directory
+				continue;
+			}
 			_cleanup_free_ char *full_path = NULL;
 			if (asprintf(&full_path, "%s/%s", path, ent->d_name) < 0) {
 				pr_perror("%s: Failed to create path for chperm", id);
@@ -373,8 +382,8 @@ static int move_mounts(const char *id,
 		       const char *path,
 		       const char **config_mounts,
 		       unsigned config_mounts_len,
-		       int uid,
-		       int gid,
+		       uint uid,
+		       uint gid,
 		       char *options
 	) {
 
@@ -441,8 +450,8 @@ static int prestart(const char *rootfs,
 		const char *mount_label,
 		const char **config_mounts,
 		unsigned config_mounts_len,
-		int uid,
-		int gid)
+		uint uid,
+		uint gid)
 {
 	_cleanup_close_  int fd = -1;
 	_cleanup_free_   char *options = NULL;
@@ -638,6 +647,11 @@ static int prestart(const char *rootfs,
 	}
 	if (!contains_mount(id, config_mounts, config_mounts_len, CGROUP_ROOT)) {
 		rc = mount_cgroup(id, rootfs, options, systemd_path);
+		if (rc < 0) {
+			pr_perror("%s: mount_cgroup failed", id);
+			return -1;
+		}
+
 	} else {
 		if ((makepath(systemd_path, 0755) == -1) && (errno != EEXIST)) {
 			pr_perror("%s: Failed to mkdir new dest: %s", id, systemd_path);
@@ -1105,6 +1119,6 @@ int main(int argc, char *argv[])
 	} else {
 		pr_pdebug("%s: only runs in prestart and poststop stage, ignoring", id);
 	}
-
+	free(config_mounts);
 	return EXIT_SUCCESS;
 }
