@@ -18,7 +18,7 @@
 #include <inttypes.h>
 #include <linux/limits.h>
 #include <selinux/selinux.h>
-#include <yajl/yajl_tree.h>
+#include <jansson.h>
 #include <stdbool.h>
 
 #include "config.h"
@@ -69,14 +69,6 @@ static inline void mnt_free_fsp(struct libmnt_fs **itr) {
 #define _cleanup_fclose_ _cleanup_(fclosep)
 #define _cleanup_mnt_iter_ _cleanup_(mnt_free_iterp)
 #define _cleanup_mnt_fs_ _cleanup_(mnt_free_fsp)
-
-#define DEFINE_CLEANUP_FUNC(type, func)                         \
-	static inline void func##p(type *p) {                   \
-		if (*p)                                         \
-			func(*p);                               \
-	}                                                       \
-
-DEFINE_CLEANUP_FUNC(yajl_val, yajl_tree_free)
 
 #define pr_perror(fmt, ...) syslog(LOG_ERR, "systemdhook <error>: " fmt ": %m\n", ##__VA_ARGS__)
 #define pr_pinfo(fmt, ...) syslog(LOG_INFO, "systemdhook <info>: " fmt "\n", ##__VA_ARGS__)
@@ -831,9 +823,9 @@ fail:
 
 int main(int argc, char *argv[])
 {
-	_cleanup_(yajl_tree_freep) yajl_val node = NULL;
-	_cleanup_(yajl_tree_freep) yajl_val config_node = NULL;
-	char errbuf[PATH_MAX+100];
+	_cleanup_(json_decrefp) json_t *node = NULL;
+	_cleanup_(json_decrefp) json_t *config_node = NULL;
+        json_error_t err;
 	char *stateData;
 	char *configData;
 	char config_file_name[PATH_MAX];
@@ -845,24 +837,23 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 
 	/* Parse the state */
-	memset(errbuf, 0, sizeof(errbuf));
-	node = yajl_tree_parse((const char *)stateData, errbuf, sizeof(errbuf));
+	memset(err.text, 0, sizeof(err.text));
+	node = json_loads((const char *)stateData, 0, &err);
 	if (node == NULL) {
-		if (strlen(errbuf)) {
-			pr_perror("parse_error: %s", errbuf);
+		if (strlen(err.text)) {
+			pr_perror("parse_error: %s", err.text);
 		} else {
 			pr_perror("parse_error: unknown error");
 		}
 		return EXIT_FAILURE;
 	}
 
-	const char *id_path[] = { "id", (const char *)0 };
-	yajl_val v_id = yajl_tree_get(node, id_path, yajl_t_string);
+	json_t *v_id = json_object_get(node, "id");
 	if (!v_id) {
 		pr_perror("id not found in state");
 		return EXIT_FAILURE;
 	}
-	char *container_uuid = YAJL_GET_STRING(v_id);
+	char *container_uuid = json_string_value(v_id);
 	_cleanup_free_ char *id = NULL;
 	id = shortid(container_uuid);
 	if (!id) {
@@ -870,20 +861,17 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	const char *pid_path[] = { "pid", (const char *) 0 };
-	yajl_val v_pid = yajl_tree_get(node, pid_path, yajl_t_number);
+	json_t *v_pid = json_object_get(node, "pid");
 	if (!v_pid) {
 		pr_perror("%s: pid not found in state", id);
 		return EXIT_FAILURE;
 	}
-	int target_pid = YAJL_GET_INTEGER(v_pid);
+	int target_pid = json_integer_value(v_pid);
 
 	/* 'bundle' must be specified for the OCI hooks, and from there we read the configuration file */
-	const char *bundle_path[] = { "bundle", (const char *)0 };
-	yajl_val v_bundle_path = yajl_tree_get(node, bundle_path, yajl_t_string);
+	json_t *v_bundle_path = json_object_get(node, "bundle");
 	if (!v_bundle_path) {
-		const char *bundle_path[] = { "bundlePath", (const char *)0 };
-		v_bundle_path = yajl_tree_get(node, bundle_path, yajl_t_string);
+		json_t *v_bundle_path = json_object_get(node, "bundlePath");
 	}
 	if (!v_bundle_path) {
 		/****
@@ -893,7 +881,7 @@ int main(int argc, char *argv[])
 		pr_pinfo("%s: Failed reading state data: bundlePath not found.  Generally this indicates Docker versions prior to 1.12 are installed.", id);
 		return EXIT_SUCCESS;
 	}
-	snprintf(config_file_name, sizeof(config_file_name), "%s/config.json", YAJL_GET_STRING(v_bundle_path));
+	snprintf(config_file_name, sizeof(config_file_name), "%s/config.json", json_string_value(v_bundle_path));
 	fp = fopen(config_file_name, "r");
 
 	if (fp == NULL) {
@@ -902,17 +890,17 @@ int main(int argc, char *argv[])
 	}
 
 	/* Read the entire config file */
-	snprintf(errbuf, sizeof(errbuf), "failed to read config data from %s", config_file_name);
-	configData = getJSONstring(fp, (size_t)CHUNKSIZE, errbuf);
+	snprintf(err.text, sizeof(err.text), "failed to read config data");
+	configData = getJSONstring(fp, (size_t)CHUNKSIZE, err.text);
 	if (configData == NULL)
 		return EXIT_FAILURE;
 
 	/* Parse the config file */
-	memset(errbuf, 0, sizeof(errbuf));
-	config_node = yajl_tree_parse((const char *)configData, errbuf, sizeof(errbuf));
+	memset(err.text, 0, sizeof(err.text));
+        config_node = json_loads((const char *)configData, 0, &err);
 	if (config_node == NULL) {
-		if (strlen(errbuf)) {
-			pr_perror("%s: parse_error: %s", id, errbuf);
+		if (strlen(err.text)) {
+			pr_perror("%s: parse_error: %s", id, err.text);
 		} else {
 			pr_perror("%s: parse_error: unknown error", id);
 		}
@@ -920,18 +908,18 @@ int main(int argc, char *argv[])
 	}
 
 	const char *args_path[] = {"process", "args", (const char *)0 };
-	yajl_val v_args = yajl_tree_get(config_node, args_path, yajl_t_array);
+	json_t *v_args = json_object_get(config_node, *args_path);
 	if (!v_args) {
 		pr_perror("%s: args not found in config", id);
 		return EXIT_FAILURE;
 	}
 
 	const char *envs[] = {"process", "env", (const char *)0 };
-	yajl_val v_envs = yajl_tree_get(config_node, envs, yajl_t_array);
+	json_t *v_envs = json_object_get(config_node, *envs);
 	if (v_envs) {
-		for (unsigned int i = 0; i < YAJL_GET_ARRAY(v_envs)->len; i++) {
-			yajl_val v_env = YAJL_GET_ARRAY(v_envs)->values[i];
-			char *str = YAJL_GET_STRING(v_env);
+		for (unsigned int i = 0; i < json_array_size(v_envs); i++) {
+			json_t *v_env = json_array_size(v_envs);
+			char *str = json_string_value(v_env);
 			/****
 			* If the oci-systemd-hook variable is passed with "disabled",
 			* stop execution of oci-systemd-hook.
@@ -958,8 +946,8 @@ int main(int argc, char *argv[])
 
 #if ARGS_CHECK
 	char *cmd = NULL;
-	yajl_val v_arg0_value = YAJL_GET_ARRAY(v_args)->values[0];
-	cmd = YAJL_GET_STRING(v_arg0_value);
+	size_t v_arg0_value = json_array_size(v_args);
+	cmd = json_string_value(v_arg0_value);
 	/* Don't do anything if init is actually container runtime bind mounted /dev/init */
 	if (!strcmp(cmd, "/dev/init")) {
 		pr_pdebug("%s: Skipping as container command is /dev/init, not systemd init", id);
@@ -974,18 +962,18 @@ int main(int argc, char *argv[])
 
 	/* Extract values from the config json */
 	const char *root_path[] = { "root", "path", (const char *)0 };
-	yajl_val v_root = yajl_tree_get(config_node, root_path, yajl_t_string);
+	json_t *v_root = json_object_get(config_node, *root_path);
 	if (!v_root) {
 		pr_perror("%s: root path not found in config.json", id);
 		return EXIT_FAILURE;
 	}
-	char *rootfs = YAJL_GET_STRING(v_root);
+	char *rootfs = json_string_value(v_root);
 
 	/* Prepend bundle path if the rootfs string is relative */
 	if (rootfs[0] != '/') {
 		char *new_rootfs;
 
-		if (asprintf(&new_rootfs, "%s/%s", YAJL_GET_STRING(v_bundle_path), rootfs) < 0) {
+		if (asprintf(&new_rootfs, "%s/%s", json_string_value(v_bundle_path), rootfs) < 0) {
 			pr_perror("%s: failed to alloc rootfs", id);
 			return EXIT_FAILURE;
 		}
@@ -997,14 +985,13 @@ int main(int argc, char *argv[])
 	unsigned config_mounts_len = 0;
 	unsigned array_len = 0;
 
-	const char *mount_points_path[] = {"mounts", (const char *)0 };
-	yajl_val v_mounts = yajl_tree_get(config_node, mount_points_path, yajl_t_array);
+	json_t *v_mounts = json_object_get(config_node, "mounts");
 	if (!v_mounts) {
 		pr_perror("%s: mounts not found in config", id);
 		return EXIT_FAILURE;
 	}
 
-	config_mounts_len = YAJL_GET_ARRAY(v_mounts)->len;
+	config_mounts_len = json_array_size(v_mounts);
 	config_mounts = malloc (sizeof(char *) * (config_mounts_len + 1));
 	if (! config_mounts) {
 		pr_perror("%s: error malloc'ing", id);
@@ -1012,15 +999,14 @@ int main(int argc, char *argv[])
 	}
 
 	for (unsigned int i = 0; i < config_mounts_len; i++) {
-		yajl_val v_mounts_values = YAJL_GET_ARRAY(v_mounts)->values[i];
+		size_t v_mounts_values = json_array_size(v_mounts);
 
-		const char *destination_path[] = {"destination", (const char *)0 };
-		yajl_val v_destination = yajl_tree_get(v_mounts_values, destination_path, yajl_t_string);
+		json_t *v_destination = json_object_get(v_mounts_values, "destination");
 		if (!v_destination) {
 			pr_perror("%s: Cannot find mount destination", id);
 			return EXIT_FAILURE;
 		}
-		config_mounts[i] = YAJL_GET_STRING(v_destination);
+		config_mounts[i] = json_string_value(v_destination);
 	}
 
 	/* OCI hooks set target_pid to 0 on poststop, as the container process
@@ -1041,33 +1027,33 @@ int main(int argc, char *argv[])
 		char *mount_label = NULL;
 		/* Extract values from the config json */
 		const char *mount_label_path[] = { "linux", "mountLabel", (const char *)0 };
-		yajl_val v_mount = yajl_tree_get(config_node, mount_label_path, yajl_t_string);
-		mount_label = v_mount ? YAJL_GET_STRING(v_mount) : "";
+		json_t *v_mount = json_object_get(config_node, *mount_label_path);
+		mount_label = v_mount ? json_string_value(v_mount) : "";
 
 		/* Get the gid value. */
 		int gid = -1;
 		const char *gid_mappings[] = {"linux", "gidMappings", (const char *)0 };
-		yajl_val v_gidMappings = yajl_tree_get(config_node, gid_mappings, yajl_t_array);
+		json_t *v_gidMappings = json_object_get(config_node, *gid_mappings);
 		if (!v_gidMappings) {
 			pr_pdebug("%s: gidMappings not found in config", id);
 			gid=0;
 		}
 
-		const char *container_path[] = {"containerID", (const char *)0 };
+		//const char *container_path[] = {"containerID", (const char *)0 };
 		if (gid != 0) {
-			array_len = YAJL_GET_ARRAY(v_gidMappings)->len;
+			array_len = json_array_size(v_gidMappings);
 			if (array_len < 1) {
 				pr_perror("%s: No gid for container found", id);
 				return EXIT_FAILURE;
 			}
 
-			const char *gid_path[] = {"hostID", (const char *)0 };
+			//const char *gid_path[] = {"hostID", (const char *)0 };
 			for (unsigned int i = 0; i < array_len; i++) {
-				yajl_val v_gidMappings_values = YAJL_GET_ARRAY(v_gidMappings)->values[i];
-				yajl_val v_containerId = yajl_tree_get(v_gidMappings_values, container_path, yajl_t_number);
-				if (YAJL_GET_INTEGER(v_containerId) == 0) {
-					yajl_val v_gid = yajl_tree_get(v_gidMappings_values, gid_path, yajl_t_number);
-					gid = v_gid ? YAJL_GET_INTEGER(v_gid) : -1;
+				size_t v_gidMappings_values = json_array_size(v_gidMappings);
+				json_t *v_containerId = json_object_get(v_gidMappings_values, "containerID");
+				if (json_integer_value(v_containerId) == 0) {
+					json_t *v_gid = json_object_get(v_gidMappings_values, "hostID");
+					gid = v_gid ? json_integer_value(v_gid) : -1;
 					i = array_len;
 				}
 			}
@@ -1078,26 +1064,26 @@ int main(int argc, char *argv[])
 		/* Get the uid value. */
 		int uid = -1;
 		const char *uid_mappings[] = {"linux", "uidMappings", (const char *)0 };
-		yajl_val v_uidMappings = yajl_tree_get(config_node, uid_mappings, yajl_t_array);
+		json_t *v_uidMappings = json_object_get(config_node, *uid_mappings);
 		if (!v_uidMappings) {
 			pr_pdebug("%s: uidMappings not found in config", id);
 			uid = 0;
 		}
 
 		if (uid !=0) {
-			array_len = YAJL_GET_ARRAY(v_uidMappings)->len;
+			array_len = json_array_size(v_uidMappings);
 			if (array_len < 1) {
 				pr_perror("%s: No uid for container found", id);
 				return EXIT_FAILURE;
 			}
 
-			const char *uid_path[] = {"hostID", (const char *)0 };
+			//const char *uid_path[] = {"hostID", (const char *)0 };
 			for (unsigned int i = 0; i < array_len; i++) {
-				yajl_val v_uidMappings_values = YAJL_GET_ARRAY(v_uidMappings)->values[i];
-				yajl_val v_containerId = yajl_tree_get(v_uidMappings_values, container_path, yajl_t_number);
-				if (YAJL_GET_INTEGER(v_containerId) == 0) {
-					yajl_val v_uid = yajl_tree_get(v_uidMappings_values, uid_path, yajl_t_number);
-					uid = v_uid ? YAJL_GET_INTEGER(v_uid) : -1;
+				size_t v_uidMappings_values = json_array_size(v_uidMappings);
+				json_t *v_containerId = json_object_get(v_uidMappings_values, "containerID");
+				if (json_integer_value(v_containerId) == 0) {
+					json_t *v_uid = json_object_get(v_uidMappings_values, "hostID");
+					uid = v_uid ? json_integer_value(v_uid) : -1;
 					i = array_len;
 				}
 			}
